@@ -1,0 +1,124 @@
+#!/bin/bash
+set -e
+
+[ "$(id -u)" -eq 0 ] || { echo "Run as root"; exit 1; }
+
+echo "==== Updating system ===="
+apt update
+apt install -y unzip zip wget curl fontconfig
+
+echo "==== Installing Java 21 ===="
+apt install -y openjdk-21-jdk
+
+JAVA_HOME_PATH=$(dirname $(dirname $(readlink -f $(which java))))
+echo "Detected JAVA_HOME: $JAVA_HOME_PATH"
+
+# =====================================================
+# Jenkins Setup
+# =====================================================
+
+echo "==== Setting up Jenkins ===="
+
+mkdir -p /opt/jenkins
+cd /opt/jenkins || exit 1
+
+if [ ! -f /opt/jenkins/jenkins.war ]; then
+  wget -O jenkins.war https://get.jenkins.io/war-stable/latest/jenkins.war
+fi
+
+id jenkins &>/dev/null || useradd -r -m -d /var/lib/jenkins -s /bin/bash jenkins
+mkdir -p /var/lib/jenkins
+chown -R jenkins:jenkins /opt/jenkins /var/lib/jenkins
+
+cat > /etc/systemd/system/jenkins.service <<EOF
+[Unit]
+Description=Jenkins (WAR)
+After=network.target
+
+[Service]
+User=jenkins
+Group=jenkins
+WorkingDirectory=/var/lib/jenkins
+Environment=JAVA_HOME=${JAVA_HOME_PATH}
+ExecStart=/usr/bin/java -jar /opt/jenkins/jenkins.war --httpPort=8080
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# =====================================================
+# SonarQube Setup
+# =====================================================
+
+echo "==== Setting up SonarQube ===="
+
+# Kernel params (idempotent)
+sysctl -w vm.max_map_count=262144
+sysctl -w fs.file-max=65536
+
+grep -qxF 'vm.max_map_count=262144' /etc/sysctl.conf || echo 'vm.max_map_count=262144' >> /etc/sysctl.conf
+grep -qxF 'fs.file-max=65536' /etc/sysctl.conf || echo 'fs.file-max=65536' >> /etc/sysctl.conf
+
+SONAR_VERSION="26.2.0.119303"
+SONAR_URL="https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-${SONAR_VERSION}.zip"
+
+# Validate URL before download
+wget --spider "$SONAR_URL" || { echo "ERROR: Invalid SonarQube version."; exit 1; }
+
+if [ ! -d /opt/sonarqube ]; then
+  cd /tmp || exit 1
+  wget "$SONAR_URL"
+  unzip sonarqube-${SONAR_VERSION}.zip
+  mv sonarqube-${SONAR_VERSION} /opt/sonarqube
+fi
+
+id sonarqube &>/dev/null || useradd -r -s /bin/bash sonarqube
+chown -R sonarqube:sonarqube /opt/sonarqube
+
+# Bind Sonar to all interfaces
+sed -i 's|#sonar.web.host=0.0.0.0|sonar.web.host=0.0.0.0|g' /opt/sonarqube/conf/sonar.properties
+
+# Detect correct Sonar bin directory (amd64 or arm64)
+SONAR_BIN_DIR=$(ls -d /opt/sonarqube/bin/linux-* | head -1)
+
+cat > /etc/systemd/system/sonarqube.service <<EOF
+[Unit]
+Description=SonarQube
+After=network.target
+
+[Service]
+Type=forking
+User=sonarqube
+Group=sonarqube
+Environment=JAVA_HOME=${JAVA_HOME_PATH}
+LimitNOFILE=65536
+LimitNPROC=4096
+ExecStart=${SONAR_BIN_DIR}/sonar.sh start
+ExecStop=${SONAR_BIN_DIR}/sonar.sh stop
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# =====================================================
+# Start Services
+# =====================================================
+
+systemctl daemon-reload
+systemctl enable --now jenkins
+systemctl enable --now sonarqube
+
+echo "==============================================="
+echo "Installation Complete"
+echo ""
+echo "Jenkins: http://<EC2-PUBLIC-IP>:8080"
+echo "Initial Jenkins password:"
+echo "/var/lib/jenkins/secrets/initialAdminPassword"
+echo "(May take 30–60 seconds after startup)"
+echo ""
+echo "SonarQube: http://<EC2-PUBLIC-IP>:9000"
+echo "==============================================="
